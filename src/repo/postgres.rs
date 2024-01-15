@@ -716,24 +716,14 @@ LIMIT 1;
     }
 }
 
-/// Create a dynamic SQL query and params from a subscription filter.
-fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
-    // if the filter is malformed, don't return anything.
-    if f.force_no_match {
-        return None;
-    }
-
-    let mut query = QueryBuilder::new("SELECT e.\"content\", e.created_at FROM \"event\" e WHERE ");
-
-    // This tracks whether we need to push a prefix AND before adding another clause
-    let mut push_and = false;
+fn generate_filter_components(f: &ReqFilter, query: &mut QueryBuilder<Postgres>, push_and: &mut bool) -> bool {
     // Query for "authors", allowing prefix matches
     if let Some(auth_vec) = &f.authors {
         // filter out non-hex values
         let auth_vec: Vec<&String> = auth_vec.iter().filter(|a| is_hex(a)).collect();
 
         if auth_vec.is_empty() {
-            return None;
+            return false;
         }
         query.push("(e.pub_key in (");
 
@@ -746,19 +736,19 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
         for pk in auth_vec.iter() {
             pk_delegated_sep.push_bind(hex::decode(pk).ok());
         }
-        push_and = true;
+        *push_and = true;
         query.push("))");
     }
 
     // Query for Kind
     if let Some(ks) = &f.kinds {
         if ks.is_empty() {
-            return None;
+            return false;
         }
-        if push_and {
+        if *push_and {
             query.push(" AND ");
         }
-        push_and = true;
+        *push_and = true;
 
         query.push("e.kind in (");
         let mut list_query = query.separated(", ");
@@ -773,16 +763,16 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
         // filter out non-hex values
         let id_vec: Vec<&String> = id_vec.iter().filter(|a| is_hex(a)).collect();
         if id_vec.is_empty() {
-            return None;
+            return false;
         }
-        if push_and {
+        if *push_and {
             query.push(" AND (");
         } else {
             query.push("(");
         }
-        push_and = true;
+        *push_and = true;
 
-        query.push("id in (");
+        query.push("e.id in (");
         let mut sep = query.separated(", ");
         for id in id_vec.iter() {
             sep.push_bind(hex::decode(id).ok());
@@ -793,16 +783,16 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
     // Query for tags
     if let Some(map) = &f.tags {
         if !map.is_empty() {
-            if push_and {
+            if *push_and {
                 query.push(" AND ");
             }
-            push_and = true;
+            *push_and = true;
 
             let mut push_or = false;
             query.push("e.id IN (SELECT ee.id FROM \"event\" ee LEFT JOIN tag t on ee.id = t.event_id WHERE ee.hidden != 1::bit(1) and ");
             for (key, val) in map.iter() {
                 if val.is_empty() {
-                    return None;
+                    return false;
                 }
                 if push_or {
                     query.push(" OR ");
@@ -819,7 +809,8 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
                     // plain value match first
                     let mut tag_query = query.separated(", ");
                     for v in val.iter().filter(|v| !is_lower_hex(v)) {
-                        tag_query.push_bind(v.as_bytes());
+                        let bytes = v.clone().into_bytes();
+                        tag_query.push_bind(bytes);
                     }
                 }
                 if has_plain_values && has_hex_values {
@@ -843,10 +834,10 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
 
     // Query for timestamp
     if f.since.is_some() {
-        if push_and {
+        if *push_and {
             query.push(" AND ");
         }
-        push_and = true;
+        *push_and = true;
         query
             .push("e.created_at >= ")
             .push_bind(Utc.timestamp_opt(f.since.unwrap() as i64, 0).unwrap());
@@ -854,13 +845,45 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
 
     // Query for timestamp
     if f.until.is_some() {
-        if push_and {
+        if *push_and {
             query.push(" AND ");
         }
-        push_and = true;
+        *push_and = true;
         query
             .push("e.created_at <= ")
             .push_bind(Utc.timestamp_opt(f.until.unwrap() as i64, 0).unwrap());
+    }
+    return true;
+}
+
+/// Create a dynamic SQL query and params from a subscription filter.
+fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
+    // if the filter is malformed, don't return anything.
+    if f.force_no_match {
+        return None;
+    }
+
+    let mut query = QueryBuilder::new("SELECT e.\"content\", e.created_at FROM \"event\" e WHERE ");
+
+    // This tracks whether we need to push a prefix AND before adding another clause
+    let mut push_and = false;
+
+    if !generate_filter_components(f, &mut query, &mut push_and) {
+        return None;
+    }
+
+    if let Some(not_filter) = &f.not {
+        if push_and {
+            query.push(" AND ");
+            push_and = false;
+        }
+
+        query.push("NOT (");
+        if !generate_filter_components(not_filter, &mut query, &mut push_and) {
+            return None;
+        }
+        query.push(")");
+        push_and = true;
     }
 
     // never display hidden events
@@ -928,6 +951,7 @@ mod tests {
                     "63fe6318dc58583cfe16810f86dd09e18bfd76aabc24a0081ce2856f330504ed".to_owned(),
                 ]),
             )])),
+            not: None,
             force_no_match: false,
         };
 
@@ -947,6 +971,7 @@ mod tests {
             ]),
             limit: None,
             tags: Some(HashMap::from([('d', HashSet::from(["test".to_owned()]))])),
+            not: None,
             force_no_match: false,
         };
 
@@ -972,6 +997,7 @@ mod tests {
                     "63fe6318dc58583cfe16810f86dd09e18bfd76aabc24a0081ce2856f330504ed".to_owned(),
                 ]),
             )])),
+            not: None,
             force_no_match: false,
         };
 
@@ -992,6 +1018,7 @@ mod tests {
                 ('d', HashSet::from(["follow".to_owned()])),
                 ('t', HashSet::from(["siamstr".to_owned()])),
             ])),
+            not: None,
             force_no_match: false,
         };
         let q = query_from_filter(&filter).unwrap();
@@ -1008,8 +1035,38 @@ mod tests {
             authors: None,
             limit: None,
             tags: Some(HashMap::from([('a', HashSet::new())])),
+            not: None,
             force_no_match: false,
         };
         assert!(query_from_filter(&filter).is_none());
+    }
+
+    #[test]
+    fn test_query_not_filter() {
+        let filter = ReqFilter {
+            ids: None,
+            kinds: Some(vec![1, 6, 16, 30023, 1063, 6969]),
+            since: Some(1700697846),
+            until: None,
+            authors: None,
+            limit: None,
+            tags: None,
+            not: Some(Box::new(ReqFilter {
+                ids: Some(vec![
+                    "84de35e2584d2b144aae823c9ed0b0f3deda09648530b93d1a2a146d1dea9864".to_owned(),
+                ]),
+                kinds: Some(vec![9734, 9735]),
+                since: None,
+                until: None,
+                authors: None,
+                limit: None,
+                tags: None,
+                not: None,
+                force_no_match: false,
+            })),
+            force_no_match: false,
+        };
+        let q = query_from_filter(&filter).unwrap();
+        assert_eq!(q.sql(), "SELECT e.\"content\", e.created_at FROM \"event\" e WHERE e.kind in ($1, $2, $3, $4, $5, $6) AND e.created_at >= $7 AND NOT (e.kind in ($8, $9) AND (e.id in ($10))) AND e.hidden != 1::bit(1) AND (e.expires_at IS NULL OR e.expires_at > now()) ORDER BY e.created_at ASC LIMIT 1000")
     }
 }

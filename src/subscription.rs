@@ -36,6 +36,8 @@ pub struct ReqFilter {
     pub limit: Option<u64>,
     /// Set of tags
     pub tags: Option<HashMap<char, HashSet<String>>>,
+    /// Filter that should not match
+    pub not: Option<Box<ReqFilter>>,
     /// Force no matches due to malformed data
     // we can't represent it in the req filter, so we don't want to
     // erroneously match.  This basically indicates the req tried to
@@ -74,6 +76,9 @@ impl Serialize for ReqFilter {
                 map.serialize_entry(&format!("#{k}"), &vals)?;
             }
         }
+        if let Some(not) = &self.not {
+            map.serialize_entry("not", not)?;
+        }
         map.end()
     }
 }
@@ -98,6 +103,7 @@ impl<'de> Deserialize<'de> for ReqFilter {
             authors: None,
             limit: None,
             tags: None,
+            not: None,
             force_no_match: false,
         };
         let empty_string = "".into();
@@ -153,6 +159,17 @@ impl<'de> Deserialize<'de> for ReqFilter {
                     rf.force_no_match = true;
                     continue;
                 }
+            } else if key == "not" {
+                let not_filter: Option<ReqFilter> = Deserialize::deserialize(val).ok();
+                if let Some(nf) = not_filter.as_ref() {
+                    if nf.not.is_some() {
+                        return Err(serde::de::Error::invalid_type(
+                            Unexpected::Other("nested not filter"),
+                            &"a json object",
+                        ));
+                    }
+                }
+                rf.not = not_filter.map(Box::new);
             }
         }
         rf.tags = ts;
@@ -337,6 +354,14 @@ impl ReqFilter {
         self.kinds.as_ref().map_or(true, |ks| ks.contains(&kind))
     }
 
+    fn match_not(&self, event: &Event) -> bool {
+        if let Some(not) = &self.not {
+            not.interested_in_event(event)
+        } else {
+            false
+        }
+    }
+
     /// Determine if all populated fields in this filter match the provided event.
     #[must_use]
     pub fn interested_in_event(&self, event: &Event) -> bool {
@@ -347,6 +372,7 @@ impl ReqFilter {
             && self.kind_match(event.kind)
             && (self.authors_match(event) || self.delegated_authors_match(event))
             && self.tag_match(event)
+            && !self.match_not(event)
             && !self.force_no_match
     }
 }
@@ -646,6 +672,44 @@ mod tests {
             content: "".to_owned(),
             sig: "".to_owned(),
             tagidx: None,
+        };
+        assert!(!s.interested_in_event(&e));
+        Ok(())
+    }
+
+    #[test]
+    fn not_ids_filter() -> Result<()> {
+        // not filter should not prevent match
+        let s: Subscription = serde_json::from_str(r#"["REQ","xyz",{"not":{"ids":["abc"]}}]"#)?;
+        let e = Event {
+            id: "def".to_owned(),
+            pubkey: "xyz".to_owned(),
+            delegated_by: None,
+            created_at: 0,
+            kind: 0,
+            tags: Vec::new(),
+            content: "".to_owned(),
+            sig: "".to_owned(),
+            tagidx: None
+        };
+        assert!(s.interested_in_event(&e));
+        Ok(())
+    }
+
+    #[test]
+    fn not_ids_filter_no_match() -> Result<()> {
+        // not filter should prevent match
+        let s: Subscription = serde_json::from_str(r#"["REQ","xyz",{"not":{"ids":["abc"]}}]"#)?;
+        let e = Event {
+            id: "abc".to_owned(),
+            pubkey: "xyz".to_owned(),
+            delegated_by: None,
+            created_at: 0,
+            kind: 0,
+            tags: Vec::new(),
+            content: "".to_owned(),
+            sig: "".to_owned(),
+            tagidx: None
         };
         assert!(!s.interested_in_event(&e));
         Ok(())

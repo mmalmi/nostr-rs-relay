@@ -961,31 +961,7 @@ fn override_index(f: &ReqFilter) -> Option<String> {
     None
 }
 
-/// Create a dynamic SQL subquery and params from a subscription filter (and optional explicit index used)
-fn query_from_filter(f: &ReqFilter) -> (String, Vec<Box<dyn ToSql>>, Option<String>) {
-    // build a dynamic SQL query.  all user-input is either an integer
-    // (sqli-safe), or a string that is filtered to only contain
-    // hexadecimal characters.  Strings that require escaping (tag
-    // names/values) use parameters.
-
-    // if the filter is malformed, don't return anything.
-    if f.force_no_match {
-        let empty_query = "SELECT e.content FROM event e WHERE 1=0".to_owned();
-        // query parameters for SQLite
-        let empty_params: Vec<Box<dyn ToSql>> = vec![];
-        return (empty_query, empty_params, None);
-    }
-
-    // check if the index needs to be overridden
-    let idx_name = override_index(f);
-    let idx_stmt = idx_name
-        .as_ref()
-        .map_or_else(|| "".to_owned(), |i| format!("INDEXED BY {i}"));
-    let mut query = format!("SELECT e.content FROM event e {idx_stmt}");
-    // query parameters for SQLite
-    let mut params: Vec<Box<dyn ToSql>> = vec![];
-
-    // individual filter components (single conditions such as an author or event ID)
+fn generate_filter_components(f: &ReqFilter, params: &mut Vec<Box<dyn ToSql>>) -> Vec<String> {
     let mut filter_components: Vec<String> = Vec::new();
     // Query for "authors", allowing prefix matches
     if let Some(authvec) = &f.authors {
@@ -1079,6 +1055,46 @@ fn query_from_filter(f: &ReqFilter) -> (String, Vec<Box<dyn ToSql>>, Option<Stri
         let until_clause = format!("created_at <= {}", f.until.unwrap());
         filter_components.push(until_clause);
     }
+    return filter_components;
+}
+
+/// Create a dynamic SQL subquery and params from a subscription filter (and optional explicit index used)
+fn query_from_filter(f: &ReqFilter) -> (String, Vec<Box<dyn ToSql>>, Option<String>) {
+    // build a dynamic SQL query.  all user-input is either an integer
+    // (sqli-safe), or a string that is filtered to only contain
+    // hexadecimal characters.  Strings that require escaping (tag
+    // names/values) use parameters.
+
+    // if the filter is malformed, don't return anything.
+    if f.force_no_match {
+        let empty_query = "SELECT e.content FROM event e WHERE 1=0".to_owned();
+        // query parameters for SQLite
+        let empty_params: Vec<Box<dyn ToSql>> = vec![];
+        return (empty_query, empty_params, None);
+    }
+
+    // check if the index needs to be overridden
+    let idx_name = override_index(f);
+    let idx_stmt = idx_name
+        .as_ref()
+        .map_or_else(|| "".to_owned(), |i| format!("INDEXED BY {i}"));
+    let mut query = format!("SELECT e.content FROM event e {idx_stmt}");
+    // query parameters for SQLite
+    let mut params: Vec<Box<dyn ToSql>> = vec![];
+
+    // individual filter components (single conditions such as an author or event ID)
+    let mut filter_components: Vec<String> = generate_filter_components(f, &mut params);
+
+    if let Some(not_filter) = &f.not {
+        let not_filter_components = generate_filter_components(not_filter, &mut params);
+
+        // Create a SQL clause that negates the 'not' filter components
+        if !not_filter_components.is_empty() {
+            let not_clause = format!("NOT ({})", not_filter_components.join(" AND "));
+            filter_components.push(not_clause);
+        }
+    }
+
     // never display hidden events
     query.push_str(" WHERE hidden!=TRUE");
     // never display hidden events
